@@ -1,0 +1,181 @@
+import numpy as np
+import cv2
+
+# 放大
+#padding (已知目标hw)
+def padding_zc(src, new_h, new_w):
+    """
+    :param src: src gray
+    :param new_h: dst h
+    :param new_w: dst w
+    :return: dst gray
+    """
+    s_h, s_w = src.shape[:2]
+    if new_h < s_h or new_w < s_w:
+        return src
+    # dh, dw
+    dh, dw = abs(new_h - s_h), abs(new_w - s_w)
+    # 上下左右平均padding
+    up = dh//2
+    down = dh - dh//2
+    left = dw//2
+    right = dw - dw//2
+    dst = np.pad(src, ((up,down),(left,right)), "constant")
+    return dst
+
+# --------------- 上采样 ---------------
+#转置卷积
+def invConv_zc(src, new_h, new_w):
+    import numpy as np
+
+    def transposed_conv_numpy(src: np.ndarray, kernel: np.ndarray, stride=2, padding=0, output_padding=0):
+        h, w = src.shape
+        kernel_size = kernel.shape[0]
+
+        # ========================
+        # 1. 先把图像扩大（插入0）→ 上采样核心
+        # ========================
+        h_up = h * stride
+        w_up = w * stride
+        src_up = np.zeros((h_up, w_up), dtype=np.float32)
+        src_up[::stride, ::stride] = src  # 每隔 stride 个位置放原值，其余补0
+
+        # ========================
+        # 2. 卷积核旋转180度（转置卷积规则）
+        # ========================
+        kernel_rot = np.rot90(kernel, 2)
+
+        # ========================
+        # 3. 计算输出尺寸
+        # ========================
+        h_out = h_up - kernel_size + 1 + 2 * padding + output_padding
+        w_out = w_up - kernel_size + 1 + 2 * padding + output_padding
+
+        # ========================
+        # 4. 填充 padding
+        # ========================
+        if padding > 0:
+            src_pad = np.pad(src_up, ((padding, padding), (padding, padding)), mode='constant')
+        else:
+            src_pad = src_up
+
+        # ========================
+        # 5. 普通卷积（和你之前学的一模一样）
+        # ========================
+        dst = np.zeros((h_out, w_out), dtype=np.float32)
+        k = kernel_size
+        for i in range(h_out):
+            for j in range(w_out):
+                window = src_pad[i:i + k, j:j + k]
+                dst[i, j] = np.sum(window * kernel_rot)
+
+        return dst
+
+#线性差值(双)
+def linear_zc(src, new_h, new_w):
+    """
+    :param src: src gray
+    :param new_h: dst h
+    :param new_w: dst w
+    :return: dst gray
+    """
+    s_h, s_w = src.shape[:2]
+    if new_h < s_h or new_w < s_w:
+        return src
+    y_point = np.linspace(0, s_h, new_h, np.float32)
+    x_point = np.linspace(0, s_w, new_w, np.float32)
+    y_grid, x_grid = np.meshgrid(y_point, x_point, indexing="ij") # reshape成和原图一样形状
+    # y_grid = np.tile(y_point.reshape(new_h,1),(1,new_w)) # (1,new_w)-行方向复制1次，列方向复制new_w次
+    # y_grid = np.tile(y_point.reshape(1,new_w),(new_h,1))
+    # 四角
+    y0 = int(y_grid)
+    y1 = y0 + 1
+    x0 = int(y_grid)
+    x1 = x0 + 1
+    # 安全边界
+    y1, x1 = np.clip(y1,0,h-1), np.clip(x1,0,wh-1)
+    # weight
+    dy = y_point - y0
+    dx = x_point - x0
+    p00 = img[y0, x0]
+    p01 = img[y0, x1]
+    p10 = img[y1, x0]
+    p11 = img[y1, x1]
+    dst = (1-dy)*(1-dx)*p00 + (1-dy)*dx*p01 + dy*(1-dx)*p10 + dy*dx*p11
+    return dst
+
+
+# 缩小
+#crop (已知目标hw)
+def crop_zc(src, new_h, new_w):
+    """
+    :param src: src gray
+    :param new_h: dst h
+    :param new_w: dst w
+    :return: dst gray
+    """
+    s_h, s_w = src.shape[:2]
+    if new_h > s_h or new_w > s_w:
+        return src
+    # dh, dw
+    dh, dw = abs(new_h - s_h), abs(new_w - s_w)
+    # 上下左右平均crop
+    up = dh // 2
+    left = dw // 2
+    dst = img[up:up+new_h,left:left+new_w]
+    return dst
+
+# --------------- 下采样 ---------------
+#跨步卷积
+def conv_zc(src, kernel, stride=2, bias):
+    """
+    :param src: src gray
+    :param kernel: 卷积核(k*k)
+    :param stride: 步长
+    :param bias: 偏置项
+    :return: dst gray
+    """
+    h, w = src.shape[:2]
+    #padding
+    new_h, new_w = h+stride, w+stride
+    pad_img = padding_zc(src, new_h, new_w)
+    pad_h, pad_w = pad_img.shape[:2]
+    #windows
+    k_size = kernel[0]
+    h_out = (pad_h - k_size) // stride + 1
+    w_out = (pad_w - k_size) // stride + 1
+    windows = pad_img.reshape(k_size, h_out, k_size, w_out)
+    #conv = windows * kernel + bias
+    dst = np.sum(windows * kernel,axis=(1,3))+bias
+    return dst
+
+
+#池化(平均/最大) 带padding
+def pooling_zc(src, pool_size=2, stride=2, ptype = 'max'):
+    """
+    手动实现最大池化操作
+    :param src: src gray
+    :param pool_size: 池化窗口大小
+    :param stride: 滑动步长
+    :return: 池化后的特征图
+    """
+    # 计算输出特征图尺寸
+    h, w = src.shape[:2]
+    # padding
+    new_h, new_w = h+stride, w+stride
+    pad_img = padding_zc(src, new_h, new_w)
+    h_pad, w_pad = pad_img.shape[:2]
+    h_out = (h_pad - pool_size) // stride + 1
+    w_out = (w_pad - pool_size) // stride + 1
+    #池化
+    windows = src[:h_out * stride, :w_out * stride].reshape(h_out, pool_size, w_out, pool_size)
+    if ptype=='max':
+        # 最大池化 - 每个窗口维度宽高取最大
+        dst = windows.max(axis=(1, 3))  # 在窗口高pool_size、宽pool_size窗口上做 max
+        # 平均池化 - 每个窗口维度宽高取平均
+    if ptype == 'mean':
+        dst = windows.mean(axis=(1, 3))  # 在窗口高pool_size、宽pool_size窗口上做 max
+
+    return dst
+
+
